@@ -7,13 +7,13 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//	"bytes"
-	//"math/rand"
+	"bytes"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	//"6.5840/kvsrv1/lock"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
@@ -77,12 +77,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.curTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 
@@ -93,17 +94,21 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var curterm int
+	var votedFor int
+	var log []*LogEntry
+	if d.Decode(&curterm) != nil ||
+       d.Decode(&votedFor) != nil ||
+       d.Decode(&log) != nil {
+        // 解码错误
+        return
+    } else {
+        rf.curTerm = curterm
+        rf.votedFor = votedFor
+        rf.log = log
+    }
 }
 
 // how many bytes in Raft's persisted log?
@@ -172,6 +177,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.curTerm = args.Term
 		rf.votedFor = -1
 		rf.state = FOLLOWER
+		rf.persist()
 	}
 
 	vote := (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && 
@@ -181,6 +187,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.lastHeartbeat = time.Now()
+		rf.persist()
 	} else {
 		reply.VoteGranted = false	
 	}
@@ -232,6 +239,12 @@ type AppendEntriesArg struct {
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+
+	// opt
+	Conflict bool
+	XTerm int
+	XIdx int
+	XLen int
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArg, reply *AppendEntriesReply) bool {
@@ -254,17 +267,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 		rf.curTerm = args.Term
 		rf.state = FOLLOWER
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	rf.lastHeartbeat = time.Now()
 
 	if rf.state == CANDIDATE {
 		rf.state = FOLLOWER
+		rf.persist()
 	}
 
-	if args.PrevLogIdx > 0 && (rf.LastLogIdx() < args.PrevLogIdx || rf.log[args.PrevLogIdx].Term != args.PrevLogTerm) {
-		return 
-	}
+	if rf.LastLogIdx() < args.PrevLogIdx {
+        reply.Conflict = true
+        reply.XTerm = -1
+        reply.XIdx = -1
+        reply.XLen = len(rf.log)
+        return
+    }
+    if rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
+        reply.Conflict = true
+        xTerm := rf.log[args.PrevLogIdx].Term
+        for xIndex := args.PrevLogIdx; xIndex > 0; xIndex-- {
+            if rf.log[xIndex-1].Term != xTerm {
+                reply.XIdx = xIndex
+                break
+            }
+        }
+        reply.XTerm = xTerm
+        reply.XLen = len(rf.log)
+        return
+    }
 
 	if len(args.Entries) > 0 {
 		idx := args.PrevLogIdx + 1
@@ -274,6 +306,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 				break
 			}
 		}
+		rf.persist()
 	}
 
 	if args.LeaderCommit > rf.commitIdx {
@@ -333,6 +366,7 @@ func (rf *Raft) startElection() {
 	lastlogidx := rf.LastLogIdx()
 	lastlogterm := rf.LastLogTerm()
 	rf.lastHeartbeat = time.Now()
+	rf.persist()
 
 	rf.mu.Unlock()
 
@@ -362,6 +396,7 @@ func (rf *Raft) startElection() {
 					rf.curTerm = reply.Term
 					rf.state = FOLLOWER
 					rf.votedFor = -1
+					rf.persist()
 					return
 				}
 
@@ -437,6 +472,7 @@ func (rf *Raft) sendHeartbeat() {
 					rf.curTerm = reply.Term
 					rf.state = FOLLOWER
 					rf.votedFor = -1
+					rf.persist()
 					return
 				}
 
@@ -448,6 +484,25 @@ func (rf *Raft) sendHeartbeat() {
                         rf.nextIdx[server] = max(rf.nextIdx[server], newNextIdx)
                         rf.matchIdx[server] = max(rf.matchIdx[server], newMatchIdx)
 						rf.updateCommitIdx()
+					} else if reply.Conflict {
+						if reply.XTerm == -1 {
+							rf.nextIdx[server] = reply.XLen
+						} else {
+							found := false
+							for i := len(rf.log) - 1; i >= 0; i-- {
+								if rf.log[i].Term == reply.XTerm {
+									// 找到了该任期的日志，将nextIndex设置为该任期的最后一个条目之后
+									rf.nextIdx[server] = i + 1
+									found = true
+									break
+								}
+							}
+							
+							if !found {
+								// 未找到该任期，直接跳到follower中该任期的第一个条目
+								rf.nextIdx[server] = reply.XIdx
+							}
+						}	
 					} else {
 						if rf.nextIdx[server] > 1 {
 							rf.nextIdx[server]--
@@ -489,6 +544,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term: term,
 	}
 	rf.log = append(rf.log, log)
+	rf.persist()
 	rf.nextIdx[rf.me] = len(rf.log)
     rf.matchIdx[rf.me] = len(rf.log) - 1
 	
@@ -516,13 +572,12 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-const timeoutms = 300
-
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here (3A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
+		timeoutms := 200 + (rand.Int() % 200)
 		timeout := time.Since(rf.lastHeartbeat) > time.Duration(timeoutms) * time.Millisecond
 		state := rf.state
 		rf.mu.Unlock()
@@ -534,8 +589,7 @@ func (rf *Raft) ticker() {
 		}
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		//ms := 50 + (rand.Int63() % 300)
-		ms := 150
+		ms := 100
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
