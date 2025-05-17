@@ -8,7 +8,7 @@ package raft
 
 import (
 	//	"bytes"
-	"math/rand"
+	//"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -258,7 +258,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 
 	rf.lastHeartbeat = time.Now()
 
-	if args.PrevLogIdx > 0 && (len(rf.log) <= args.PrevLogIdx || rf.log[args.PrevLogIdx].Term != args.PrevLogIdx) {
+	if rf.state == CANDIDATE {
+		rf.state = FOLLOWER
+	}
+
+	if args.PrevLogIdx > 0 && (rf.LastLogIdx() < args.PrevLogIdx || rf.log[args.PrevLogIdx].Term != args.PrevLogTerm) {
 		return 
 	}
 
@@ -273,8 +277,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArg, reply *AppendEntriesReply)
 	}
 
 	if args.LeaderCommit > rf.commitIdx {
-		rf.commitIdx = min(args.LeaderCommit, len(rf.log)-1)
-		rf.applyCommitedEntries()
+		rf.commitIdx = min(args.LeaderCommit, rf.LastLogIdx())
+		//rf.applyCommitedEntries()
 	}
 
 	reply.Success = true
@@ -311,7 +315,9 @@ func (rf *Raft) updateCommitIdx() {
 			}
 			if cnt > len(rf.peers)/2 {
 				rf.commitIdx = n
-				rf.applyCommitedEntries()
+				//rf.applyCommitedEntries()
+			} else {
+				break
 			}
 		}
 	}
@@ -378,16 +384,20 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) sendHeartbeat() {
+	rf.mu.Lock()
 	if rf.state != LEADER {
+		rf.mu.Unlock()
 		return
 	}
-	rf.mu.Lock()
 	term := rf.curTerm
 	commitidx := rf.commitIdx
 	rf.mu.Unlock()
 
 	for i := range rf.peers {
 		if i == rf.me {
+			rf.mu.Lock()
+			rf.lastHeartbeat = time.Now()
+			rf.mu.Unlock()
 			continue
 		}
 		go func(server int) {
@@ -432,8 +442,11 @@ func (rf *Raft) sendHeartbeat() {
 
 				if rf.state == LEADER && rf.curTerm == term {
 					if reply.Success {
-						rf.nextIdx[server] = prevlogidx + len(entries) + 1
-						rf.matchIdx[server] = rf.nextIdx[server] - 1
+						newNextIdx := prevlogidx + 1 + len(entries)
+                        newMatchIdx := newNextIdx - 1
+                        
+                        rf.nextIdx[server] = max(rf.nextIdx[server], newNextIdx)
+                        rf.matchIdx[server] = max(rf.matchIdx[server], newMatchIdx)
 						rf.updateCommitIdx()
 					} else {
 						if rf.nextIdx[server] > 1 {
@@ -461,14 +474,27 @@ func (rf *Raft) sendHeartbeat() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if rf.state != LEADER {
+		return -1, -1, false
+	}
+	index := rf.LastLogIdx() + 1
+	term := rf.curTerm
 
-	return index, term, isLeader
+	log := &LogEntry {
+		Command: command,
+		Term: term,
+	}
+	rf.log = append(rf.log, log)
+	rf.nextIdx[rf.me] = len(rf.log)
+    rf.matchIdx[rf.me] = len(rf.log) - 1
+	
+	//rf.applyCommitedEntries()
+
+	return index, term, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -490,7 +516,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-const timeoutms = 100
+const timeoutms = 300
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
@@ -508,7 +534,8 @@ func (rf *Raft) ticker() {
 		}
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		//ms := 50 + (rand.Int63() % 300)
+		ms := 150
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -555,7 +582,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	go rf.applyCommitedEntries()
 
 	return rf
 }
