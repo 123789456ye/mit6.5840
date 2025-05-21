@@ -22,6 +22,8 @@ type PutArgs struct {
 	Key     string
 	Value   string
 	Version Tversion
+	ClientId int64
+	RequestId int
 }
 
 type PutReply struct {
@@ -30,6 +32,8 @@ type PutReply struct {
 
 type GetArgs struct {
 	Key string
+	ClientId int64
+	RequestId int
 }
 
 type GetReply struct {

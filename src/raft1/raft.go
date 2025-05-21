@@ -148,7 +148,16 @@ func (rf *Raft) PersistBytes() int {
 }
 
 func (rf *Raft) getByIndex(index int) (int, bool) {
-	i := index - rf.lastIncludedIdx
+	i, j := 0, len(rf.log)-1
+	for i < j {
+		mid := (i + j) >> 1
+		if rf.log[mid].Idx >= index {
+			j = mid
+		} else {
+			i = mid + 1
+		}
+	}
+	//i := index - rf.lastIncludedIdx
 	return i, i >= 0 && i < len(rf.log) && rf.log[i].Idx == index
 }
 
@@ -170,7 +179,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.log[0].Idx = rf.lastIncludedIdx
 
 	rf.lastApplied = max(rf.lastApplied, rf.lastIncludedIdx)
-	DPrintf("S%d Snapshot Index %d Logindex %d", rf.me, index, k)
 	rf.persistSnapshot(snapshot)
 }
 
@@ -437,7 +445,6 @@ func (rf *Raft) applyCommitedEntries() {
 			}
 			rf.snapshotMsg = raftapi.ApplyMsg{}
 			rf.mu.Unlock()
-			DPrintf("S%d Snapshot Message sent", rf.me)
 
 			rf.applyCh <- msg
 			rf.mu.Lock()
@@ -465,10 +472,7 @@ func (rf *Raft) applyCommitedEntries() {
 			rf.mu.Unlock()
 
 			for _, msg := range msgsToApply {
-				
-				rf.applyCh <- msg
-				DPrintf("S%d Apply Command %d", rf.me, msg.CommandIndex)
-				
+				rf.applyCh <- msg				
 			}
 			rf.mu.Lock()
 		}
@@ -696,7 +700,6 @@ func (rf *Raft) updateCommitIdx() {
 			}
 		}
 	}
-	DPrintf("S%d Update CommitIdx to %d", rf.me, rf.commitIdx)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start

@@ -53,6 +53,8 @@ type RSM struct {
 
 	killCh chan struct{}
 	shutdownCh   chan struct{}
+
+	snapshotTrigger *time.Ticker
 }
 
 type OpResult struct {
@@ -91,7 +93,17 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
 
+	snapshot := persister.ReadSnapshot()
+    if len(snapshot) > 0 {
+        sm.Restore(snapshot)
+    }
+
 	go rsm.applier()
+
+	if maxraftstate != -1 {
+        rsm.snapshotTrigger = time.NewTicker(100 * time.Millisecond)
+        go rsm.snapshotMonitor()
+    }
 
 	return rsm
 }
@@ -115,6 +127,10 @@ func (rsm *RSM) Kill() {
     if rsm.shutdownCh != nil {
         close(rsm.shutdownCh)
         rsm.shutdownCh = nil
+    }
+
+	if rsm.snapshotTrigger != nil {
+        rsm.snapshotTrigger.Stop()
     }
 
 	for idx, ch := range rsm.waitingOps {
@@ -208,6 +224,21 @@ func (rsm *RSM) applier() {
 	}
 }
 
+func (rsm *RSM) snapshotMonitor() {
+    for !rsm.killed() {
+        <-rsm.snapshotTrigger.C
+        
+        rsm.mu.Lock()
+        
+        if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() >= rsm.maxraftstate * 9/10 {
+            snapshot := rsm.sm.Snapshot()
+            rsm.rf.Snapshot(rsm.lastApplied, snapshot)
+        }
+        
+        rsm.mu.Unlock()
+    }
+}
+
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
 // try again.
@@ -246,7 +277,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	checkTicker := time.NewTicker(50 * time.Millisecond)
     defer checkTicker.Stop()
 
-	TimeoutCh := time.After(10 * time.Second)
+	TimeoutCh := time.After(1 * time.Second)
     
     for {
         select {
