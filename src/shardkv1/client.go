@@ -1,51 +1,141 @@
 package shardkv
 
-//
-// client code to talk to a sharded key/value service.
-//
-// the client uses the shardctrler to query for the current
-// configuration and find the assignment of shards (keys) to groups,
-// and then talks to the group that holds the key's shard.
-//
-
 import (
+    "sync"
+    "time"
 
-	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/shardkv1/shardctrler"
-	"6.5840/tester1"
+    "6.5840/kvsrv1/rpc"
+    "6.5840/shardkv1/shardcfg"
+    "6.5840/shardkv1/shardgrp"
+    "6.5840/tester1"
 )
 
 type Clerk struct {
-	clnt *tester.Clnt
-	sck  *shardctrler.ShardCtrler
-	// You will have to modify this struct.
+    clnt      *tester.Clnt
+    sck       ShardCtrlerQuery // interface for querying shard controller
+    
+    mu        sync.Mutex
+    config    *shardcfg.ShardConfig
+    grpClerks map[tester.Tgid]*shardgrp.Clerk
 }
 
-// The tester calls MakeClerk and passes in a shardctrler so that
-// client can call it's Query method
-func MakeClerk(clnt *tester.Clnt, sck *shardctrler.ShardCtrler) kvtest.IKVClerk {
-	ck := &Clerk{
-		clnt: clnt,
-		sck:  sck,
-	}
-	// You'll have to add code here.
-	return ck
+// Interface for querying the shard controller
+type ShardCtrlerQuery interface {
+    Query() *shardcfg.ShardConfig
 }
 
+func MakeClerk(clnt *tester.Clnt, sck ShardCtrlerQuery) *Clerk {
+    ck := &Clerk{
+        clnt:      clnt,
+        sck:       sck,
+        config:    sck.Query(),
+        grpClerks: make(map[tester.Tgid]*shardgrp.Clerk),
+    }
+    return ck
+}
 
-// Get a key from a shardgrp.  You can use shardcfg.Key2Shard(key) to
-// find the shard responsible for the key and ck.sck.Query() to read
-// the current configuration and lookup the servers in the group
-// responsible for key.  You can make a clerk for that group by
-// calling shardgrp.MakeClerk(ck.clnt, servers).
+// Get the clerk for a specific shardgroup, creating it if necessary
+func (ck *Clerk) getShardGrpClerk(gid tester.Tgid, servers []string) *shardgrp.Clerk {
+    ck.mu.Lock()
+    defer ck.mu.Unlock()
+    
+    if clerk, exists := ck.grpClerks[gid]; exists {
+        return clerk
+    }
+    
+    clerk := shardgrp.MakeClerk(ck.clnt, servers)
+    ck.grpClerks[gid] = clerk
+    return clerk
+}
+
+// Update configuration when needed
+func (ck *Clerk) updateConfig() {
+    ck.mu.Lock()
+    defer ck.mu.Unlock()
+    
+    newConfig := ck.sck.Query()
+    if newConfig != nil && (ck.config == nil || newConfig.Num > ck.config.Num) {
+        ck.config = newConfig
+    }
+}
+
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-	// You will have to modify this function.
-	return "", 0, ""
+    maxRetry := 10
+
+    for retry := 0; retry < maxRetry; retry++  {
+        ck.mu.Lock()
+        config := ck.config
+        ck.mu.Unlock()
+        
+        if config == nil {
+            ck.updateConfig()
+            time.Sleep(100 * time.Millisecond)
+            continue
+        }
+        
+        shard := shardcfg.Key2Shard(key)
+        gid, servers, ok := config.GidServers(shard)
+        
+        if !ok || gid == 0 || len(servers) == 0 {
+            ck.updateConfig()
+            time.Sleep(100 * time.Millisecond)
+            continue
+        }
+        
+        // Get or create the clerk for this group
+        grpClerk := ck.getShardGrpClerk(gid, servers)
+        value, version, err := grpClerk.Get(key)
+        
+        if err == rpc.ErrWrongGroup {
+            // Group doesn't believe it owns this shard, config may be stale
+            ck.updateConfig()
+            time.Sleep(100 * time.Millisecond)
+            continue
+        }
+        
+        return value, version, err
+    }
+
+    return "", 0, rpc.ErrMaybe
 }
 
-// Put a key to a shard group.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
-	return ""
+    maxRetry := 10
+    
+    for retry := 0; retry < maxRetry; retry++ {
+        ck.mu.Lock()
+        config := ck.config
+        ck.mu.Unlock()
+        
+        if config == nil {
+            ck.updateConfig()
+            time.Sleep(100 * time.Millisecond)
+            continue
+        }
+        
+        shard := shardcfg.Key2Shard(key)
+        gid, servers, ok := config.GidServers(shard)
+        
+        if !ok || gid == 0 || len(servers) == 0 {
+            ck.updateConfig()
+            time.Sleep(100 * time.Millisecond)
+            continue
+        }
+        
+        // Get or create the clerk for this group
+        grpClerk := ck.getShardGrpClerk(gid, servers)
+        err := grpClerk.Put(key, value, version)
+        
+        if err == rpc.ErrWrongGroup {
+            // Group doesn't believe it owns this shard, config may be stale
+            ck.updateConfig()
+            time.Sleep(100 * time.Millisecond)
+            continue
+        } else if err == rpc.ErrVersion {
+            return rpc.ErrMaybe
+        }
+        
+        return err
+    }
+    return rpc.ErrMaybe
 }

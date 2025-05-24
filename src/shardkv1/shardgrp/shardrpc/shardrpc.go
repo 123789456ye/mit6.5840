@@ -8,6 +8,8 @@ import (
 type FreezeShardArgs struct {
 	Shard shardcfg.Tshid
 	Num   shardcfg.Tnum
+	ClientId int64
+    RequestId int
 }
 
 type FreezeShardReply struct {
@@ -20,6 +22,8 @@ type InstallShardArgs struct {
 	Shard shardcfg.Tshid
 	State []byte
 	Num   shardcfg.Tnum
+	ClientId int64
+    RequestId int
 }
 
 type InstallShardReply struct {
@@ -29,6 +33,8 @@ type InstallShardReply struct {
 type DeleteShardArgs struct {
 	Shard shardcfg.Tshid
 	Num   shardcfg.Tnum
+	ClientId int64
+    RequestId int
 }
 
 type DeleteShardReply struct {

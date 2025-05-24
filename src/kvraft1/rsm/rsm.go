@@ -277,7 +277,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	checkTicker := time.NewTicker(50 * time.Millisecond)
     defer checkTicker.Stop()
 
-	TimeoutCh := time.After(1 * time.Second)
+	TimeoutCh := time.After(5 * time.Second)
     
     for {
         select {
